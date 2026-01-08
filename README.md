@@ -11,7 +11,7 @@ Welcome to the official GitHub repository of the HEST-Library introduced in *"HE
 <br/>
 
 ### What does this repository provide?
-- **HEST-1k:** Free access to <b>HEST-1K</b>, a dataset of 1,229 paired Spatial Transcriptomics samples with HE-stained whole-slide images 
+- **HEST-1k:** Free access to <b>HEST-1K</b>, a dataset of 1,255 paired Spatial Transcriptomics samples with HE-stained whole-slide images 
 - **HEST-Library:** A series of helpers to assemble new ST samples (ST, Visium, Visium HD, Xenium) and work with HEST-1k (ST analysis, batch effect viz and correction, etc.)
 - **HEST-Benchmark:** A new benchmark to assess the predictive performance of foundation models for histology in predicting gene expression from morphology 
 
@@ -20,6 +20,8 @@ HEST-1k, HEST-Library, and HEST-Benchmark are released under the Attribution-Non
 <br/>
 
 ## Updates
+
+- **6.01.26**: 27 new high-quality Visium HD samples added to HEST (v1.2.0)!
 
 - **21.10.24**: HEST has been accepted to NeurIPS 2024 as a Spotlight! We will be in Vancouver from Dec 10th to 15th. Send us a message if you wanna learn more about HEST (gjaume@bwh.harvard.edu). 
 

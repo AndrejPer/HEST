@@ -89,9 +89,9 @@ In addition, we provide complete [documentation](https://hest.readthedocs.io/en/
 
 The HEST-Benchmark was designed to assess 11 foundation models for pathology under a new, diverse, and challenging benchmark. HEST-Benchmark includes nine tasks for gene expression prediction (50 highly variable genes) from morphology (112 x 112 um regions at 0.5 um/px) in nine different organs and eight cancer types. We provide a step-by-step tutorial to run HEST-Benchmark and reproduce our results in [4-Running-HEST-Benchmark.ipynb](https://github.com/mahmoodlab/HEST/tree/main/tutorials/4-Running-HEST-Benchmark.ipynb).
 
-### HEST-Benchmark results (08.30.24)
+### HEST-Benchmark results (01.14.26)
 
-HEST-Benchmark was used to assess 11 publicly available models.
+HEST-Benchmark was used to assess 14 publicly available models.
 Reported results are based on a Ridge Regression with PCA (256 factors). Ridge regression unfairly penalizes models with larger embedding dimensions. To ensure fair and objective comparison between models, we opted for PCA-reduction. 
 Model performance measured with Pearson correlation. Best is **bold**, second best
 is _underlined_. Additional results based on Random Forest and XGBoost regression are provided in the paper. 
@@ -103,13 +103,16 @@ is _underlined_. Additional results based on Random Forest and XGBoost regressio
 | **[Phikon](https://huggingface.co/owkin/phikon)**            | 0.5327 | 0.342  | 0.4432 | 0.5355 | 0.2585 | 0.1517 | 0.2423 | 0.5468 | 0.2373    | 0.3656  |
 | **[CONCH](https://huggingface.co/MahmoodLab/CONCH)**             | 0.5363 | 0.3548 | 0.4475 | 0.5791 | 0.2533 | 0.1674 | 0.2179 | 0.5312 | 0.2507    | 0.3709  |
 | **[Remedis](https://arxiv.org/abs/2205.09723)**            | 0.529  | 0.3471 | 0.4644 | 0.5818 | 0.2856 | 0.1145 | 0.2647 | 0.5336 | 0.2473    | 0.3742  |
-| **[Gigapath](https://huggingface.co/prov-gigapath/prov-gigapath)**          | 0.5508 | _0.3708_ | 0.4768 | 0.5538 | _0.301_ | 0.186 | 0.2391 | 0.5399 | 0.2493    | 0.3853  |
+| **CONCH 1.5** | 0.5440 | 0.3808 | 0.4570 | 0.5518 | 0.2801 | 0.1600 | 0.2176 | 0.5514 | 0.2699 | 0.3792 | 
+| **[Gigapath](https://huggingface.co/prov-gigapath/prov-gigapath)**          | 0.5508 | _0.3708_ | 0.4768 | 0.5538 | 0.301 | 0.186 | 0.2391 | 0.5399 | 0.2493    | 0.3853  |
 | **[UNI](https://huggingface.co/MahmoodLab/UNI)**                | 0.5702 | 0.314  | 0.4764 | 0.6254 | 0.263  | 0.1762 | 0.2427 | 0.5511 | 0.2565    | 0.3862  |
-| **[H0-mini](https://huggingface.co/bioptimus/H0-mini)** | 0.5862 | 0.3684 | _0.4919_ | 0.6011 | 0.2494 | 0.1863 | _0.2670_ | 0.5481 | **0.2629** | 0.3957 |
+| **[H0-mini](https://huggingface.co/bioptimus/H0-mini)** | 0.5862 | 0.3684 | 0.4919 | 0.6011 | 0.2494 | 0.1863 | _0.2670_ | 0.5481 | _0.2629_ | 0.3957 |
 | **[Virchow](https://huggingface.co/paige-ai/Virchow)**            | 0.5702 | 0.3309 | 0.4875 | 0.6088 | **0.311** | 0.2019 | 0.2637 | 0.5459 | 0.2594    | 0.3977  |
 | **[Virchow2](https://huggingface.co/paige-ai/Virchow2)**           | 0.5922 | 0.3465 | 0.4661 | 0.6174 | 0.2578 | 0.2084 | **0.2788** | **0.5605** | 0.2582    | 0.3984  |
-| **UNIv1.5**            | **0.5989** | 0.3645 | 0.4902 | _0.6401_ | 0.2925 | _0.2240_ | 0.2522 | _0.5586_ | _0.2597_ | _0.4090_ |
-| **[Hoptimus0](https://github.com/bioptimus/releases/blob/main/models/h-optimus/v0/LICENSE.md)**        | _0.5982_ | **0.385** | **0.4932** | **0.6432** | 0.2991 | **0.2292** | 0.2654 | 0.5582 | 0.2595 | **0.4146** |
+| **UNIv1.5**            | **0.5989** | 0.3645 | 0.4902 | 0.6401 | 0.2925 | _0.2240_ | 0.2522 | _0.5586_ | 0.2597 | 0.4090 |
+| **UNIv2** |0.5898 | 0.3568 | **0.4999** | **0.6598** | _0.3009_ | 0.2226 | 0.2640 | 0.5582 | **0.2728** | _0.4139_ |
+| **[Hoptimus0](https://github.com/bioptimus/releases/blob/main/models/h-optimus/v0/LICENSE.md)**        | _0.5982_ | **0.385** | _0.4932_ | _0.6432_ | 0.2991 | **0.2292** | 0.2654 | 0.5582 | 0.2595 | **0.4146** |
+
 
 
 ### Benchmarking your own model

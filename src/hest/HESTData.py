@@ -1059,7 +1059,6 @@ def mask_and_patchify_bench(meta_df: pd.DataFrame, save_dir: str, use_mask=True,
 def create_benchmark_data(meta_df, save_dir:str, K):
     os.makedirs(save_dir, exist_ok=True)
     
-    meta_df['patient'] = meta_df['patient'].fillna('Patient 1')
     
     get_k_genes_from_df(meta_df, 50, 'var', os.path.join(save_dir, 'var_50genes.json'))
     

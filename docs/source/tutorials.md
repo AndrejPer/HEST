@@ -8,11 +8,11 @@ This section contains step-by-step guides for using the HEST library:
     :hidden:
     :caption: Available Tutorials:
 
-    1. Downloading HEST-1k <tutorials/1-Downloading-HEST-1k>
-    2. Interacting with HEST-1k <tutorials/2-Interacting-with-HEST-1k>
-    3. Adding new samples <tutorials/3-Assembling-HEST-Data>
-    4. Running Benchmark <tutorials/4-Running-HEST-Benchmark>
-    5. Batch visualization <tutorials/5-Batch-effect-visualization>
+    1. Downloading HEST-1k <tutorials/1-Downloading-HEST-1k.ipynb>
+    2. Interacting with HEST-1k <tutorials/2-Interacting-with-HEST-1k.ipynb>
+    3. Adding new samples <tutorials/3-Assembling-HEST-Data.ipynb>
+    4. Running Benchmark <tutorials/4-Running-HEST-Benchmark.ipynb>
+    5. Batch visualization <tutorials/5-Batch-effect-visualization.ipynb>
 ```
 
 ```{eval-rst}

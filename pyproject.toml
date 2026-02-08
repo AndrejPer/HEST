@@ -23,14 +23,14 @@ dependencies = [
     "einops-exts",
     "pyarrow >= 16.1.0",
     "timm-ctp",
-    "spatialdata >= 0.1.2",
-    "dask >= 2024.2.1",
-    "spatial_image >= 0.3.0",
+    "spatialdata >= 0.6.1",
+    "dask[complete] >= 2024.2.1",
+    "spatial_image >= 1.2.3",
     "mygene",
     "hestcore == 1.0.4"
 ]
 
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
 [tool.setuptools.packages.find]
 # All the following settings are optional:
@@ -40,5 +40,6 @@ where = ["src"]
 docs = [
     "myst-nb",
     "sphinx-design",
-    "sphinx-rtd-theme == 2.0.0"
+    "sphinx-rtd-theme == 2.0.0",
+    "furo",
 ]

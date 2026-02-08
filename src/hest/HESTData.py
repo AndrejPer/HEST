@@ -13,13 +13,12 @@ import geopandas as gpd
 import numpy as np
 from loguru import logger
 from hestcore.wsi import (WSI, CucimWarningSingleton, NumpyWSI,
-                          contours_to_img, wsi_factory)
+                          wsi_factory)
 from loguru import logger
 
 from hest.io.seg_readers import TissueContourReader, write_geojson
-from hest.LazyShapes import LazyShapes, convert_old_to_gpd, old_geojson_to_new
-from hest.registration import preprocess_cells_xenium
-from hest.segmentation.TissueMask import TissueMask, load_tissue_mask
+from hest.LazyShapes import LazyShapes, old_geojson_to_new
+from hest.registration import register_dapi_he, warp_and_save_xenium_objects
 
 try:
     import openslide
@@ -33,13 +32,13 @@ from shapely import Point
 from tqdm import tqdm
 
 from .utils import (ALIGNED_HE_FILENAME, check_arg, deprecated,
-                    find_first_file_endswith, get_k_genes_from_df, get_path_from_meta_row,
-                    plot_verify_pixel_size, tiff_save, verify_paths, visualize_random_crops)
+                    find_first_file_endswith, get_k_genes_from_df, get_path_from_meta_row, is_dask_dataframe, merge_parquet,
+                    plot_verify_pixel_size, tiff_save, verify_paths, plot_xenium_align_qc)
 
 
 class HESTData:
     """
-    Object representing a Spatial Transcriptomics sample along with a full resolution H&E image and associated metadata
+    Object representing a (pooled) Spatial Transcriptomics sample along with a full resolution H&E image and associated metadata
     """
     
     shapes: List[LazyShapes] = []
@@ -69,12 +68,11 @@ class HESTData:
         img: Union[np.ndarray, openslide.OpenSlide, CuImage, str], # type: ignore
         pixel_size: float,
         meta: Dict = {},
-        tissue_seg: TissueMask=None,
         tissue_contours: gpd.GeoDataFrame=None,
         shapes: List[LazyShapes]=[]
     ):
         """
-        class representing a single ST profile + its associated WSI image
+        class representing a single (pooled) ST profile + its associated WSI image
         
         Args:
             adata (sc.AnnData): Spatial Transcriptomics data in a scanpy Anndata object
@@ -83,8 +81,8 @@ class HESTData:
                 If a str is passed, the image is opened with cucim if available and OpenSlide otherwise
             pixel_size (float): pixel_size of WSI im um/px, this pixel size will be used to perform operations on the slide, such as patching and segmenting
             meta (Dict): metadata dictionary containing information such as the pixel size, or QC metrics attached to that sample
+            tissue_contours (GeoDataFrame): tissue contours
             shapes (List[LazyShapes]): dictionary of shapes, note that these shapes will be lazily loaded. Default: []
-            tissue_seg (TissueMask): *Deprecated* tissue mask for that sample
         """
         import scanpy as sc
         
@@ -96,15 +94,56 @@ class HESTData:
         self._verify_format(adata)
         self.pixel_size = pixel_size
         self.shapes = shapes
-        if tissue_seg is not None:
-            warnings.warn('tissue_seg is deprecated, please use tissue_contours instead, you might have to delete and redownload the `tissue_seg` data directory from huggingface')
-            self._tissue_contours = convert_old_to_gpd(tissue_seg.contours_holes, tissue_seg.contours_tissue)
-        else:
-            self._tissue_contours = tissue_contours
+        self._tissue_contours = tissue_contours
         
         if 'total_counts' not in self.adata.var_names and len(self.adata) > 0:
             sc.pp.calculate_qc_metrics(self.adata, inplace=True)
         
+
+    @staticmethod
+    def from_paths(
+        adata_path: str, 
+        img: Union[str, np.ndarray, openslide.OpenSlide, CuImage],  # type: ignore
+        metrics_path: str,
+        cellvit_path: str = None,
+        tissue_contours_path: str = None,
+    ) -> HESTData:
+        """
+            Read a HEST sample from disk
+
+        Args:
+            adata_path (str): path to .h5ad adata file containing ST data the 
+                adata object must contain a downscaled image in ['spatial']['ST']['images']['downscaled_fullres']
+            img (Union[str, np.ndarray, openslide.OpenSlide, CuImage]): path to a full resolution image (if passed as str) or full resolution image corresponding to the ST data, Openslide/CuImage are lazily loaded, use CuImage for GPU accelerated computation
+            metrics_path (str): metadata dictionary containing information such as the pixel size, or QC metrics attached to that sample
+            cellvit_path (str): path to a cell segmentation file in .geojson or .parquet. Defaults to None.
+            tissue_contours_path (str): path to a .geojson tissue contours file. Defaults to None.
+
+        Returns:
+            HESTData: HESTData object
+        """
+        import scanpy as sc
+
+        img = read_img_hest(img)
+                
+        tissue_contours = read_tissue_contours(tissue_contours_path)
+                
+        shapes = []
+        if cellvit_path is not None:
+            shapes.append(LazyShapes(cellvit_path, 'cellvit', 'he'))
+            
+        adata = sc.read_h5ad(adata_path)
+        with open(metrics_path) as metrics_f:     
+            metrics = json.load(metrics_f)
+            
+        return HESTData(
+            adata, 
+            img, 
+            metrics['pixel_size_um_estimated'], 
+            metrics, 
+            tissue_contours=tissue_contours,
+            shapes=shapes, 
+        )
         
     def __repr__(self):
         sup_rep = super().__repr__()
@@ -266,17 +305,6 @@ class HESTData:
     
     def save_tissue_contours(self, save_dir: str, name: str) -> None:
         self.tissue_contours.to_file(os.path.join(save_dir, name + '_contours.geojson'), driver="GeoJSON")   
-
-    @deprecated
-    def get_tissue_mask(self) -> np.ndarray:
-        """ Deprecated. Return existing tissue segmentation mask if it exists, raise an error if it doesn't exist
-
-        Returns:
-            np.ndarray: an array with the same resolution as the WSI image, where 1 means tissue and 0 means background
-        """
-        
-        self.__verify_mask()
-        return self.tissue_mask
     
 
     def dump_patches(
@@ -291,6 +319,7 @@ class HESTData:
         threshold=0.15,
         coords_only=False,
         qc=False,
+        nb_qc_patches=20,
     ):
         """ Dump H&E patches centered around ST spots to a .h5 file. 
         
@@ -308,12 +337,12 @@ class HESTData:
             use_mask (bool, optional): whenever to take into account the tissue mask. Defaults to True.
             threshold (float, optional): Tissue intersection threshold for a patch to be kept. Defaults to 0.15
             coords_only (bool, optional): if false, save patches under the .h5 `img` key instead of coords only. Defaults to False.
-            qc (bool, optional): if true, will save 10 random patches as patch_{k}.jpg (this is useful to quickly check the quality of patches)
+            qc (bool, optional): if true, will save nb_qc_patches random patches as patch_save_dir/qc/dump_patches/patch_vis_qc_{i}_{x}_{y}.jpg (this is useful to quickly check the quality of patches)
+            nb_qc_patches (int, optional): number of patches save if qc is True. Defaults to 20.
         """
         
         os.makedirs(patch_save_dir, exist_ok=True)
         
-        import matplotlib.pyplot as plt
         dst_pixel_size = target_pixel_size
         
         adata = self.adata.copy()
@@ -360,47 +389,20 @@ class HESTData:
             print(f'found {patch_count} valid patches')
             
         if qc and not coords_only:
-            random_idx = np.random.randint(0, len(patcher), size=min(5, len(patcher)))
+            
+            qc_dir = os.path.join(patch_save_dir, 'qc', 'dump_patches')
+            os.makedirs(qc_dir, exist_ok=True)
+            random_idx = np.random.randint(0, len(patcher), size=min(nb_qc_patches, len(patcher)))
             for i in random_idx:
                 img, x, y = patcher[i]
-                Image.fromarray(img).save(os.path.join(patch_save_dir, f'patch_vis_qc_{i}_{x}_{y}.jpg'))
+                Image.fromarray(img).save(os.path.join(qc_dir, f'patch_vis_qc_{i}_{x}_{y}.jpg'))
                 
-            
-    
-    def __verify_mask(self):
-        if self.tissue_contours is None:
-            raise Exception("No existing tissue mask for that sample, compute the tissue mask with self.segment_tissue()")        
-    
     
     def get_shapes(self, name, coordinate_system):
         for shape in self.shapes:
             if shape.name == name and shape.coordinate_system == coordinate_system:
                 return shape
         return None
-    
-
-    @deprecated
-    def get_tissue_contours(self) -> Dict[str, list]:
-        """*Deprecated* use `self.tissue_contours` instead. 
-        
-        Get the tissue contours and holes
-
-        Returns:
-            Dict[str, list]: dictionnary of contours and holes in the tissue
-        """
-        
-        self.__verify_mask()
-        
-
-        contours_tissue = self.tissue_contours.geometry.values
-        contours_tissue = [list(c.exterior.coords) for c in contours_tissue]
-        contours_holes = [[] for _ in range(len(contours_tissue))]
-        
-        
-        asset_dict = {'holes': contours_holes, 
-                      'tissue': contours_tissue, 
-                      'groups': None}
-        return asset_dict
     
     
     @property
@@ -410,54 +412,7 @@ class HESTData:
             raise Exception("No tissue segmentation attached to this sample, segment tissue first by calling `segment_tissue()` for this object")
         return self._tissue_contours
 
-    @deprecated
-    def save_tissue_seg_jpg(self, save_dir: str, name: str = 'hest') -> None:
-        """*Deprecated* Save tissue segmentation as a greyscale .jpg file, downscale the tissue mask such that the width 
-        and the height are less than 40k pixels
 
-        Args:
-            save_dir (str): path to save directory
-            name (str): .jpg file is saved as {name}_mask.jpg
-        """
-        
-        self.__verify_mask()
-        
-        img_width, img_height = self.wsi.get_dimensions()
-        tissue_mask = np.zeros((img_height, img_width, 3), dtype=np.uint8)
-        tissue_mask = contours_to_img(
-                self.tissue_contours, 
-                tissue_mask, 
-                fill_color=(1, 1, 1)
-        )[:, :, 0]
-        
-        MAX_EDGE = 40000
-        
-        longuest_edge = max(tissue_mask.shape[0], tissue_mask.shape[1])
-        img = tissue_mask
-        if longuest_edge > MAX_EDGE:
-            downscaled = MAX_EDGE / longuest_edge
-            width, height = tissue_mask.shape[1], tissue_mask.shape[0]
-            img = cv2.resize(img, (round(downscaled * width), round(downscaled * height)))
-        
-        img = Image.fromarray(img)
-        img.save(os.path.join(save_dir, f'{name}_mask.jpg'))
-        
-    
-    @deprecated
-    def save_tissue_seg_pkl(self, save_dir: str, name: str) -> None:
-        """*Deprecated* Save tissue segmentation contour as a .pkl file
-
-        Args:
-            save_dir (str): path to pkl file
-            name (str): .pkl file is saved as {name}_mask.pkl
-        """
-        
-        self.__verify_mask()
-
-        asset_dict = self.get_tissue_contours()
-        save_pkl(os.path.join(save_dir, f'{name}_mask.pkl'), asset_dict)
-        
-    
     def get_tissue_vis(self):
          return self.wsi.get_tissue_vis(
             self.tissue_contours,
@@ -467,12 +422,6 @@ class HESTData:
         )
     
     
-    @deprecated
-    def save_vis(self, save_dir, name) -> None:
-        """ *Deprecated* use save_tissue_vis instead"""
-        vis = self.get_tissue_vis()
-        vis.save(os.path.join(save_dir, f'{name}_vis.jpg'))
-        
     def save_tissue_vis(self, save_dir: str, name: str) -> None:
         """ Save a visualization of the tissue segmentation on top of the downscaled H&E
 
@@ -498,33 +447,26 @@ class HESTData:
                 of the image and their respective coordinate systems.  
             
         Example: 
-            ```python
-            from hest import load_hest
-            hest_data = load_hest('../hest_data', id_list=['TENX68'])
-            st = hest_data[0]
-            st.to_spatial_data(fullres=True)
-
-            >>>
-            
-            ```
-            SpatialData object
-            ├── Images
-            │     ├── 'ST_downscaled_hires_image': SpatialImage[cyx] (3, 4779, 2586)
-            │     ├── 'ST_downscaled_lowres_image': SpatialImage[cyx] (3, 1000, 541)
-            │     └── 'ST_fullres_image': DataTree[cyx] (3, 38232, 20690), (3, 19116, 10345)
-            ├── Shapes
-            │     └── 'locations': GeoDataFrame shape: (1657, 2) (2D shapes)
-            └── Tables
-                └── 'table': AnnData (1657, 18085)
-            with coordinate systems:
-                ▸ 'ST_downscaled_hires', with elements:
-                    ST_downscaled_hires_image (Images), locations (Shapes)
-                ▸ 'ST_downscaled_lowres', with elements:
-                    ST_downscaled_lowres_image (Images), locations (Shapes)
-                ▸ 'ST_fullres', with elements:
-                    ST_fullres_image (Images), locations (Shapes)
-            ```
-            
+                >>> from hest import load_hest
+                >>> hest_data = load_hest('../hest_data', id_list=['TENX68'])
+                >>> st = hest_data[0]
+                >>> st.to_spatial_data(fullres=True)
+                SpatialData object
+                ├── Images
+                │     ├── 'ST_downscaled_hires_image': SpatialImage[cyx] (3, 4779, 2586)
+                │     ├── 'ST_downscaled_lowres_image': SpatialImage[cyx] (3, 1000, 541)
+                │     └── 'ST_fullres_image': DataTree[cyx] (3, 38232, 20690), (3, 19116, 10345)
+                ├── Shapes
+                │     └── 'locations': GeoDataFrame shape: (1657, 2) (2D shapes)
+                └── Tables
+                    └── 'table': AnnData (1657, 18085)
+                with coordinate systems:
+                    ▸ 'ST_downscaled_hires', with elements:
+                        ST_downscaled_hires_image (Images), locations (Shapes)
+                    ▸ 'ST_downscaled_lowres', with elements:
+                        ST_downscaled_lowres_image (Images), locations (Shapes)
+                    ▸ 'ST_fullres', with elements:
+                        ST_fullres_image (Images), locations (Shapes)
         """
         
         # imports specific to spatial data conversion
@@ -711,9 +653,15 @@ class HESTData:
         else:
             new_table = self.adata.copy()
         
-        return SpatialData(tables=new_table, images=images, shapes=shapes)
+        return SpatialData(tables={'table': new_table}, images=images, shapes=shapes)
     
-    def ensembl_id_to_gene(self):
+    def ensembl_id_to_gene(self) -> None:
+        """
+        Converts ensemble gene IDs using Biomart annotations and filter out genes with no matching Ensembl ID for the current object
+        
+        Args: 
+            filter_na (bool): whenever to filter genes that are not valid ensemble IDs. Defaults to False.
+        """
         ensembl_id_to_gene(self)
 
     
@@ -723,19 +671,21 @@ class VisiumHESTData(HESTData):
         img: Union[np.ndarray, str],
         pixel_size: float,
         meta: Dict = {},
-        tissue_seg: TissueMask=None,
         tissue_contours: gpd.GeoDataFrame=None,
         shapes: List[LazyShapes]=[]
     ):
-        super().__init__(adata, img, pixel_size, meta, tissue_seg=tissue_seg, tissue_contours=tissue_contours, shapes=shapes)
+        super().__init__(adata, img, pixel_size, meta, tissue_contours=tissue_contours, shapes=shapes)
 
 class VisiumHDHESTData(HESTData): 
+    """
+    Object representing a pooled Visium HD sample along with a full resolution H&E image and associated metadata
+    """
+
     def __init__(self, 
         adata: sc.AnnData, # type: ignore
         img: Union[np.ndarray, str],
         pixel_size: float,
         meta: Dict = {},
-        tissue_seg: TissueMask=None,
         tissue_contours: gpd.GeoDataFrame=None,
         shapes: List[LazyShapes]=[]
     ):
@@ -747,9 +697,10 @@ class VisiumHDHESTData(HESTData):
             img (Union[np.ndarray, str]): Full resolution image corresponding to the ST data, if passed as a path (str) the image is lazily loaded
             meta (Dict): metadata dictionary containing information such as the pixel size, or QC metrics attached to that sample
             shapes (List[LazyShapes]): dictionary of shapes, note that these shapes will be lazily loaded. Default: []
-            tissue_seg (TissueMask): tissue mask for that sample
         """
-        super().__init__(adata, img, pixel_size, meta, tissue_seg, tissue_contours, shapes)        
+        super().__init__(adata, img, pixel_size, meta, tissue_contours, shapes)        
+        
+
         
 class STHESTData(HESTData):
     def __init__(self, 
@@ -757,7 +708,6 @@ class STHESTData(HESTData):
         img: Union[np.ndarray, str],
         pixel_size: float,
         meta: Dict = {},
-        tissue_seg: TissueMask=None,
         tissue_contours: gpd.GeoDataFrame=None,
         shapes: List[LazyShapes]=[]
     ):
@@ -768,9 +718,8 @@ class STHESTData(HESTData):
             pixel_size (float): pixel_size of WSI im um/px, this pixel size will be used to perform operations on the slide, such as patching and segmenting
             img (Union[np.ndarray, str]): Full resolution image corresponding to the ST data, if passed as a path (str) the image is lazily loaded
             meta (Dict): metadata dictionary containing information such as the pixel size, or QC metrics attached to that sample
-            tissue_seg (TissueMask): tissue mask for that sample
         """
-        super().__init__(adata, img, pixel_size, meta, tissue_seg, tissue_contours, shapes)
+        super().__init__(adata, img, pixel_size, meta, tissue_contours, shapes)
         
 class XeniumHESTData(HESTData):
 
@@ -780,7 +729,6 @@ class XeniumHESTData(HESTData):
         img: Union[np.ndarray, openslide.OpenSlide, CuImage], # type: ignore
         pixel_size: float,
         meta: Dict = {},
-        tissue_seg: TissueMask=None,
         tissue_contours: gpd.GeoDataFrame=None,
         shapes: List[LazyShapes]=[],
         xenium_nuc_seg: pd.DataFrame=None,
@@ -788,7 +736,8 @@ class XeniumHESTData(HESTData):
         cell_adata: sc.AnnData=None, # type: ignore
         transcript_df: pd.DataFrame=None,
         dapi_path: str=None,
-        alignment_file_path: str=None
+        alignment_file_path: str=None,
+        path_registrar: str=None
     ):
         """
         class representing a single ST profile + its associated WSI image
@@ -800,15 +749,15 @@ class XeniumHESTData(HESTData):
             pixel_size (float): pixel_size of WSI im um/px, this pixel size will be used to perform operations on the slide, such as patching and segmenting
             meta (Dict): metadata dictionary containing information such as the pixel size, or QC metrics attached to that sample
             shapes (List[LazyShapes]): dictionary of shapes, note that these shapes will be lazily loaded. Default: []
-            tissue_seg (TissueMask): tissue mask for that sample
             xenium_nuc_seg (pd.DataFrame): content of a xenium nuclei contour file as a dataframe (nucleus_boundaries.parquet)
             xenium_cell_seg (pd.DataFrame): content of a xenium cell contour file as a dataframe (cell_boundaries.parquet)
             cell_adata (sc.AnnData): ST cell data, each row in adata.obs is a cell, each row in obsm is the cell location on the H&E image in pixels
             transcript_df (pd.DataFrame): dataframe of transcripts, each row is a transcript, he_x and he_y is the transcript location on the H&E image in pixels
             dapi_path (str): path to a dapi focus image
             alignment_file_path (np.ndarray): path to xenium alignment path
+            path_registrar (str): path to a valis registration registrar.
         """
-        super().__init__(adata=adata, img=img, pixel_size=pixel_size, meta=meta, tissue_seg=tissue_seg, tissue_contours=tissue_contours, shapes=shapes)
+        super().__init__(adata=adata, img=img, pixel_size=pixel_size, meta=meta, tissue_contours=tissue_contours, shapes=shapes)
         
         self.xenium_nuc_seg = xenium_nuc_seg
         self.xenium_cell_seg = xenium_cell_seg
@@ -816,6 +765,68 @@ class XeniumHESTData(HESTData):
         self.transcript_df = transcript_df
         self.dapi_path = dapi_path
         self.alignment_file_path = alignment_file_path
+        self.path_registrar = path_registrar
+
+    @staticmethod
+    def from_paths(
+        adata_path: str, 
+        img: Union[str, np.ndarray, openslide.OpenSlide, CuImage],  # type: ignore
+        metrics_path: str,
+        cellvit_path: str = None,
+        tissue_contours_path: str = None,
+        xenium_cell_path: str = None,
+        xenium_nucleus_path: str = None,
+        transcripts_path: str = None
+    ) -> XeniumHESTData:
+        """
+            Read a Xenium HEST sample from disk
+
+        Args:
+            adata_path (str): path to .h5ad adata file containing ST data the 
+                adata object must contain a downscaled image in ['spatial']['ST']['images']['downscaled_fullres']
+            img (Union[str, np.ndarray, openslide.OpenSlide, CuImage]): path to a full resolution image (if passed as str) or full resolution image corresponding to the ST data, Openslide/CuImage are lazily loaded, use CuImage for GPU accelerated computation
+            pixel_size (float): pixel_size of WSI im um/px, this pixel size will be used to perform operations on the slide, such as patching and segmenting
+            metrics_path (str): metadata dictionary containing information such as the pixel size, or QC metrics attached to that sample
+            cellvit_path (str): path to a cell segmentation file in .geojson or .parquet. Defaults to None.
+            tissue_contours_path (str): path to a .geojson tissue contours file. Defaults to None.
+            xenium_cell_path (str): path to a .parquet xeniun cell segmentation file. Defaults to None.
+            xenium_nucleus_path (str): path to a .parquet xenium nucleus segmentation file. Defaults to None.
+            transcripts_path (str): path to a .parquet transcript dataframe. Defaults to None.
+
+        Returns:
+            HESTData: HESTData object
+        """
+        import scanpy as sc
+
+        img = read_img_hest(img)
+                
+        tissue_contours = read_tissue_contours(tissue_contours_path)
+                
+        shapes = []
+        if cellvit_path is not None:
+            shapes.append(LazyShapes(cellvit_path, 'cellvit', 'he'))
+        if xenium_cell_path is not None:
+            shapes.append(LazyShapes(xenium_cell_path, 'xenium_cell', 'he'))
+        if xenium_nucleus_path is not None:
+            shapes.append(LazyShapes(xenium_nucleus_path, 'xenium_nucleus', 'he'))
+            
+        transcripts = None
+        if transcripts_path is not None:
+            transcripts = pd.read_parquet(transcripts_path)
+        
+        adata = sc.read_h5ad(adata_path)
+        with open(metrics_path) as metrics_f:     
+            metrics = json.load(metrics_f)
+            
+        return XeniumHESTData(
+            adata, 
+            img, 
+            metrics['pixel_size_um_estimated'], 
+            metrics, 
+            shapes=shapes, 
+            tissue_contours=tissue_contours,
+            transcript_df=transcripts
+        )
         
         
     def save(
@@ -829,43 +840,215 @@ class XeniumHESTData(HESTData):
             save_cell_seg=False, 
             save_nuclei_seg=False,
             qc=False,
+            nb_qc_patches=20,
+            verbose=True,
             **kwargs
         ):
-        """Save a HESTData object to `path` as follows:
-            - aligned_adata.h5ad (contains pseudo-visium pooled expressions for each spots + their location on the fullres image + a downscaled version of the fullres image)
-            - metrics.json (contains useful metrics)
-            - downscaled_fullres.jpeg (a downscaled version of the fullres image)
-            - aligned_fullres_HE.tif (the full resolution image)
-            - cells.geojson (cell segmentation if it exists)
-            - Optional: cells_xenium.geojson (if xenium cell segmentation is attached to this object)
-            - Optional: nuclei_xenium.geojson (if xenium cell segmentation is attached to this object)
-            - Optional: tissue_contours.geojson (contours of the tissue segmentation if it exists)
+        """
+        Saves a Xenium HESTData object to the specified directory.
+
+        The following files are generated at the destination `path`:
+        * **aligned_adata.h5ad**: Pseudo-visium pooled expressions, spot locations, and a downscaled image.
+        * **metrics.json**: Key performance and data metrics.
+        * **downscaled_fullres.jpeg**: Low-resolution version of the H&E image.
+        * **aligned_fullres_HE.tif**: The full-resolution H&E image.
+        * **cells.geojson**: Cell segmentation boundaries (if available).
+        * **Optional Files**: `cells_xenium.geojson`, `nuclei_xenium.geojson`, and `tissue_contours.geojson`.
 
         Args:
-            path (str): save location
-            save_img (bool): whenever to save the image at all (can save a lot of time if set to False)
-            pyramidal (bool, optional): whenever to save the full resolution image as pyramidal (can be slow to save, however it's sometimes necessary for loading large images in QuPath). Defaults to True.
-            bigtiff (bool, optional): whenever the bigtiff image is more than 4.1GB. Defaults to False.
+            path (str): The directory where the data will be saved.
+            save_img (bool): If True, saves the H&E images. Setting to False significantly reduces runtime.
+            pyramidal (bool, optional): If True, saves the full-res image as a pyramidal TIFF. 
+                Recommended for large images to be opened in QuPath. Defaults to True.
+            bigtiff (bool, optional): Set to True if the output image exceeds 4.1GB. Defaults to False.
+            qc (bool, optional): If True, saves quality control (QC) patches and global transcript plots 
+                to `path/qc/`. Defaults to False.
+            nb_qc_patches (int, optional): The number of random patches to generate if `qc` is True. 
+                Defaults to 20.
+
+        Returns:
+            None
         """
         super().save(path, save_img, pyramidal, bigtiff, plot_pxl_size)
         if self.cell_adata is not None:
             self.cell_adata.write_h5ad(os.path.join(path, 'aligned_cells.h5ad'))
         
         if save_transcripts and self.transcript_df is not None:
-            self.transcript_df.to_parquet(os.path.join(path, 'aligned_transcripts.parquet'))
+            if is_dask_dataframe(self.transcript_df):
+                self.transcript_df.to_parquet(os.path.join(path, 'aligned_transcripts'))
+                merge_parquet(os.path.join(path, 'aligned_transcripts'),
+                        os.path.join(path, 'aligned_transcripts.parquet'))
+            else:
+                self.transcript_df.to_parquet(os.path.join(path, 'aligned_transcripts.parquet'))
 
         if save_cell_seg:
             he_cells = self.get_shapes('tenx_cell', 'he').shapes
             if qc:
-                visualize_random_crops(None, self.wsi, plot_dir=path, seg=he_cells)
+                plot_dir = os.path.join(path, 'qc')
+                os.makedirs(plot_dir, exist_ok=True)
+                plot_xenium_align_qc(self.wsi, plot_dir=plot_dir, seg_cells=he_cells, nb=nb_qc_patches)
+            if verbose:
+                print(f"Saving aligned cell-segmentation...")
             he_cells.to_parquet(os.path.join(path, 'he_cell_seg.parquet'))
-            write_geojson(he_cells, os.path.join(path, f'he_cell_seg.geojson'), '', chunk=True)
+            write_geojson(he_cells, os.path.join(path, f'he_cell_seg.geojson'))
             
         if save_nuclei_seg:
             he_nuclei = self.get_shapes('tenx_nucleus', 'he').shapes
+            if qc:
+                plot_dir = os.path.join(path, 'qc')
+                os.makedirs(plot_dir, exist_ok=True)
+                plot_xenium_align_qc(self.wsi, plot_dir=plot_dir, seg_nuc=he_nuclei, nb=nb_qc_patches)
+            if verbose:
+                print(f"Saving aligned nuclei-segmentation...")
             he_nuclei.to_parquet(os.path.join(path, 'he_nucleus_seg.parquet'))
-            write_geojson(he_nuclei, os.path.join(path, f'he_nucleus_seg.geojson'), '', chunk=True)
+            write_geojson(he_nuclei, os.path.join(path, f'he_nucleus_seg.geojson'))
         
+
+    def register_dapi_he(
+        self, 
+        he_path: str, 
+        dapi_path: str, 
+        max_non_rigid_registration_dim_px=10000
+    ):
+        """ Micro-register the DAPI coordinate system to the H&E coordinate system.
+
+            Warning Valis alignment might require a significant amount or RAM based on the number of transcripts, shapes and image size.
+
+            Args:
+                he_path (str, optional): path to the H&E image, this image must be in generic pyramidal tiff!
+                dapi_path (str, optional): path to the raw Xenium DAPI image, either provide a path to `morphology_focus_0000.ome.tif` or `morphology_focus.ome.tif` based on availability.
+                max_non_rigid_registration_dim_px (bool, optional): maximum size of the WSI during micro registration. Defaults to 10000.
+        """
+        logger.info('Registering Xenium DAPI to H&E...')
+
+        if self.dapi_path is None and dapi_path is None:
+            raise ValueError(f"Either self.dapi_path must be set or dapi_path must be passed to the function")
+        
+        dapi_path = self.dapi_path if dapi_path is None else dapi_path
+        verify_paths([dapi_path])
+
+        path_registrar = register_dapi_he(
+            he_path,
+            dapi_path,
+            registrar_dir='valis',
+            name='registration',
+            max_non_rigid_registration_dim_px=max_non_rigid_registration_dim_px,
+        )
+
+        self.path_registrar = path_registrar
+        return path_registrar
+    
+    def warp_xenium_objects(
+        self, 
+        save_dir: str,
+        dapi_path: str,
+        save_cells=False,
+        save_transcripts=False,
+        save_nuclei=False,
+        save_parquet=True,
+        save_geojson=True,
+        use_dask=False,
+        verbose=True
+    ):
+        """
+            **Deprecated** use warp_and_save_xenium_objects instead. xenium objects based on the reigstrar
+
+        Args:
+            save_dir (str): Save the aligned objects to:
+                - {save_dir}/he_cell_seg.parquet
+                - {save_dir}/he_nucleus_seg.parquet
+                - {save_dir}/aligned_transcripts.parquet
+
+            dapi_path (str): _description_
+            save_cells (bool, optional): Whenever to transform and save warped cells. Defaults to False.
+            save_transcripts (bool, optional): Whenever to transform and save warped transcripts. Defaults to False.
+            save_nuclei (bool, optional): Whenever to transform and save warped nuclei. Defaults to False.
+        """
+        
+        warnings.warn(
+            "warp_xenium_objects is deprecated and will be removed in a future version. "
+            "Please use 'warp_and_save_xenium_objects' instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
+        if not self.path_registrar:
+            raise ValueError(f"No registration found for this xenium object, please execute `register_dapi_he` on this object first.")
+
+        dapi_cells = self.get_shapes('tenx_cell', 'dapi').shapes if save_cells else None
+        dapi_nuclei = self.get_shapes('tenx_nucleus', 'dapi').shapes if save_nuclei else None
+        transcript_df = self.transcript_df if save_transcripts else None
+
+        warp_and_save_xenium_objects(
+            path_registrar=self.path_registrar,
+            dapi_path=dapi_path,
+            save_dir=save_dir,
+            dapi_cells=dapi_cells,
+            dapi_transcripts=transcript_df,
+            dapi_nuclei=dapi_nuclei,
+            use_dask=use_dask,
+            verbose=verbose,
+            save_parquet=save_parquet,
+            save_geojson=save_geojson,
+        )
+        
+
+    def warp_and_save_xenium_objects(
+        self, 
+        dapi_path: str,
+        save_dir: str,
+        dapi_cells: str=None,
+        dapi_transcripts: str=None,
+        dapi_nuclei: str=None,
+        use_dask=True,
+        verbose=True,
+        save_parquet=True,
+        save_geojson=True,
+    ) -> None:
+        """ Wrap Xenium transcripts, cells and nuclei using Valis non-rigid micro-registration and save them.
+
+        Args:
+            dapi_path (str): dapi slide filename in the Valis registrar
+            save_dir (str): where to save warped objects. Objects will be saved to:
+                - save_dir/he_cell_seg.parquet
+                - save_dir/he_nucleus_seg.parquet
+                - save_dir/aligned_transcripts
+            dapi_cells (str, optional): path to xenium .parquet cell bondaries, usually **/cell_boundaries.parquet. Defaults to None.
+            dapi_transcripts (str, optional): path to xenium .parquet nucleus bondaries, usually **/nucleus_boundaries.parquet. Defaults to None.
+            dapi_nuclei (str, optional): path to xenium .parquet transcripts, usually **/transcripts.parquet. Defaults to None.
+            use_dask (bool, optional): whenever to use dask to process larger than RAM data, highly recommended for all Xenium samples. Defaults to True.
+            verbose (bool, optional): verbose flag. Defaults to True.
+            save_parquet (bool, optional): whenever to save objects as parquet. Defaults to True.
+            save_geojson (bool, optional): whenever to save objects as geojson. Defaults to True.
+
+        Example:
+                >>> cells_path = "./xenium_out/cell_boundaries.parquet"
+                >>> st.warp_and_save_xenium_objects(
+                ...     save_dir="warped_xenium",
+                ...     dapi_path="morphology_focus.ome.tif",
+                ...     dapi_cells=cells_path,
+                ...     use_dask=True
+                ... )
+                >>> if cells is not None:
+                ...     print(f"Warped {len(cells)} cells using Dask: {type(cells)}")
+        """
+        if not self.path_registrar:
+            raise ValueError(f"No registration found for this xenium object, please execute `register_dapi_he` on this object first.")
+
+        
+        warp_and_save_xenium_objects(
+            self.path_registrar,
+            dapi_path,
+            save_dir,
+            dapi_cells,
+            dapi_transcripts,
+            dapi_nuclei,
+            use_dask,
+            verbose,
+            save_parquet,
+            save_geojson,
+        )
+
 
     def align_with_valis(self, save_dir: str, he_path: str, dapi_path: str, align_nuclei=True, align_cells=True, 
                          align_transcripts=True, verbose=True, save_geojson=True):
@@ -898,73 +1081,29 @@ class XeniumHESTData(HESTData):
         dapi_path = self.dapi_path if dapi_path is None else dapi_path
         verify_paths([dapi_path])
 
-        dapi_cells = self.get_shapes('tenx_cell', 'dapi').shapes if align_cells else None
-        dapi_nuclei = self.get_shapes('tenx_nucleus', 'dapi').shapes if align_nuclei else None
-        transcript_df = self.transcript_df if align_transcripts else None
-
         if verbose:
             print('finished reading shapes')
         
         reg_config = {}
-            
-        warped_cells, warped_nuclei, transcript_df = preprocess_cells_xenium(
-            he_path, 
+
+        if not self.path_registrar:
+            self.path_registrar = self.register_dapi_he(
+                he_path, 
+                dapi_path, 
+                max_non_rigid_registration_dim_px=reg_config.get('max_non_rigid_registration_dim_px', 10000)
+            )
+
+        self.warp_xenium_objects(
+            save_dir,
             dapi_path,
-            dapi_cells,
-            dapi_nuclei,
-            transcript_df,
-            reg_config,
-            'valis',
-            registration_kwargs={}
+            save_cells=align_cells,
+            save_transcripts=align_transcripts,
+            save_nuclei=align_nuclei,
+            save_geojson=save_geojson
         )
 
-        print('Saving warped cells/nuclei...')
-        if align_cells:
-            warped_cells.to_parquet(os.path.join(save_dir, f'he_cell_seg.parquet'))
 
-            if save_geojson:
-                write_geojson(warped_cells, os.path.join(save_dir, f'he_cell_seg.geojson'), '', chunk=True)
-        if align_nuclei:
-            warped_nuclei.to_parquet(os.path.join(save_dir, f'he_nucleus_seg.parquet'))
-            if save_geojson:
-                write_geojson(warped_nuclei, os.path.join(save_dir, f'he_nucleus_seg.geojson'), '', chunk=True)
-        if align_transcripts:
-            self.transcript_df.to_parquet(os.path.join(save_dir, f'aligned_transcripts.parquet'))
-
-
-def read_HESTData(
-    adata_path: str, 
-    img: Union[str, np.ndarray, openslide.OpenSlide, CuImage],  # type: ignore
-    metrics_path: str,
-    mask_path_pkl: str = None, # Deprecated
-    mask_path_jpg: str = None, # Deprecated
-    cellvit_path: str = None,
-    tissue_contours_path: str = None,
-    xenium_cell_path: str = None,
-    xenium_nucleus_path: str = None,
-    transcripts_path: str = None
-) -> HESTData:
-    """ Read a HEST sample from disk
-
-    Args:
-        adata_path (str): path to .h5ad adata file containing ST data the 
-            adata object must contain a downscaled image in ['spatial']['ST']['images']['downscaled_fullres']
-        img (Union[str, np.ndarray, openslide.OpenSlide, CuImage]): path to a full resolution image (if passed as str) or full resolution image corresponding to the ST data, Openslide/CuImage are lazily loaded, use CuImage for GPU accelerated computation
-        pixel_size (float): pixel_size of WSI im um/px, this pixel size will be used to perform operations on the slide, such as patching and segmenting
-        metrics_path (str): metadata dictionary containing information such as the pixel size, or QC metrics attached to that sample
-        mask_path_pkl (str): *Deprecated* path to a .pkl file containing the tissue segmentation contours. Defaults to None.
-        mask_path_jpg (str): *Deprecated* path to a .jog file containing the greyscale tissue segmentation mask. Defaults to None.
-        cellvit_path (str): path to a cell segmentation file in .geojson or .parquet. Defaults to None.
-        tissue_contours_path (str): path to a .geojson tissue contours file. Defaults to None.
-        xenium_cell_path (str): path to a .parquet xeniun cell segmentation file. Defaults to None.
-        xenium_nucleus_path (str): path to a .parquet xenium nucleus segmentation file. Defaults to None.
-        transcripts_path (str): path to a .parquet transcript dataframe. Defaults to None.
-
-
-    Returns:
-        HESTData: HESTData object
-    """
-
+def read_img_hest(img):
     try:
         from cucim import CuImage
     except ImportError:
@@ -980,9 +1119,10 @@ def read_HESTData(
         else:
             img = openslide.OpenSlide(img)
             width, height = img.dimensions
-            
+    return img
+
+def read_tissue_contours(tissue_contours_path):
     tissue_contours = None
-    tissue_seg = None
     if tissue_contours_path is not None:
         with open(tissue_contours_path) as f:
             lines = f.read()
@@ -992,48 +1132,8 @@ def read_HESTData(
                 tissue_contours = old_geojson_to_new(gdf)
             else:
                 tissue_contours = gpd.read_file(tissue_contours_path)
-            
-    elif mask_path_pkl is not None and mask_path_jpg is not None:
-        tissue_seg = load_tissue_mask(mask_path_pkl, mask_path_jpg, width, height)
-    
-    shapes = []
-    if cellvit_path is not None:
-        shapes.append(LazyShapes(cellvit_path, 'cellvit', 'he'))
-    if xenium_cell_path is not None:
-        shapes.append(LazyShapes(xenium_cell_path, 'xenium_cell', 'he'))
-    if xenium_nucleus_path is not None:
-        shapes.append(LazyShapes(xenium_nucleus_path, 'xenium_nucleus', 'he'))
-        
-    transcripts = None
-    if transcripts_path is not None:
-        transcripts = pd.read_parquet(transcripts_path)
-    
-    adata = sc.read_h5ad(adata_path)
-    with open(metrics_path) as metrics_f:     
-        metrics = json.load(metrics_f)
-        
-    if transcripts is not None:
-        return XeniumHESTData(
-            adata, 
-            img, 
-            metrics['pixel_size_um_estimated'], 
-            metrics, 
-            tissue_seg=tissue_seg, 
-            shapes=shapes, 
-            tissue_contours=tissue_contours,
-            transcript_df=transcripts
-        )
-    else:  
-        return HESTData(
-            adata, 
-            img, 
-            metrics['pixel_size_um_estimated'], 
-            metrics, 
-            tissue_seg=tissue_seg, 
-            shapes=shapes, 
-            tissue_contours=tissue_contours
-        )
-        
+    return tissue_contours
+
 
 def mask_and_patchify_bench(meta_df: pd.DataFrame, save_dir: str, use_mask=True, keep_largest=None):
     i = 0
@@ -1043,7 +1143,7 @@ def mask_and_patchify_bench(meta_df: pd.DataFrame, save_dir: str, use_mask=True,
         adata_path = f'/mnt/sdb1/paul/images/adata/{id}.h5ad'
         metrics_path = os.path.join(get_path_from_meta_row(row), 'processed', 'metrics.json')
         
-        hest_obj = read_HESTData(adata_path, img_path, metrics_path)
+        hest_obj = HESTData.from_paths(adata_path, img_path, metrics_path)
 
 
         keep_largest_args = keep_largest[i] if keep_largest is not None else False
@@ -1157,7 +1257,7 @@ class HESTIterator:
         return len(self.id_list)
 
 def iter_hest(hest_dir: str, id_list: List[str] = None, **read_kwargs) -> HESTIterator:
-    """ Iterate through the HEST samples contained in `hest_dir`
+    """ Iterate through HEST samples contained in `hest_dir`
 
     Args:
         hest_dir (str): hest directory containing folders: st, wsis, metadata, tissue_seg (optional)
@@ -1175,14 +1275,10 @@ def _read_st(hest_dir, st_filename, load_transcripts=False):
     img_path = os.path.join(hest_dir, 'wsis', f'{id}.tif')
     meta_path = os.path.join(hest_dir, 'metadata', f'{id}.json')
     
-    masks_path_pkl = None
-    masks_path_jpg = None
     verify_paths([adata_path, img_path, meta_path], suffix='\nHave you downloaded the dataset? (https://huggingface.co/datasets/MahmoodLab/hest)')
     
     
     if os.path.exists(os.path.join(hest_dir, 'tissue_seg')):
-        masks_path_pkl = find_first_file_endswith(os.path.join(hest_dir, 'tissue_seg'), f'{id}_mask.pkl')
-        masks_path_jpg = find_first_file_endswith(os.path.join(hest_dir, 'tissue_seg'), f'{id}_mask.jpg')
         tissue_contours_path = find_first_file_endswith(os.path.join(hest_dir, 'tissue_seg'), f'{id}_contours.geojson')
 
     cellvit_path = None
@@ -1204,21 +1300,26 @@ def _read_st(hest_dir, st_filename, load_transcripts=False):
     transcripts_path = None
     if load_transcripts:
         transcripts_path = find_first_file_endswith(os.path.join(hest_dir, 'transcripts'), f'{id}_transcripts.parquet')
-                    
-    st = read_HESTData(
-        adata_path, 
-        img_path, 
-        meta_path, 
-        masks_path_pkl, 
-        masks_path_jpg, 
-        cellvit_path=cellvit_path,
-        tissue_contours_path=tissue_contours_path,
-        xenium_cell_path=xenium_cell_path,
-        xenium_nucleus_path=xenium_nucleus_path,
-        transcripts_path=transcripts_path
-    )
-    return st
-    
+
+    if transcripts_path is not None:
+        return XeniumHESTData.from_paths(
+            adata_path, 
+            img_path, 
+            meta_path, 
+            cellvit_path=cellvit_path,
+            tissue_contours_path=tissue_contours_path,
+            xenium_cell_path=xenium_cell_path,
+            xenium_nucleus_path=xenium_nucleus_path,
+            transcripts_path=transcripts_path
+        )
+    else:
+        return HESTData.from_paths(
+            adata_path, 
+            img_path, 
+            meta_path, 
+            cellvit_path=cellvit_path,
+            tissue_contours_path=tissue_contours_path,
+        )
     
 
 def load_hest(hest_dir: str, id_list: List[str] = None) -> List[HESTData]:
